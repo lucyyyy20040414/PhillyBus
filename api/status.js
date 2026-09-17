@@ -40,7 +40,11 @@ module.exports = async (req, res) => {
   // overloaded") under load. Rather than bet on one model name, try a
   // short list, newest first, and fall through on any failure — only
   // report an error if every one of them fails.
-  const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  // Confirmed against the live API (2026-09): 2.5-flash and 2.0-flash are
+  // retired for new users (404, "no longer available"), and 3.8-flash can
+  // return a transient 503 under free-tier load. 3.6-flash is what
+  // Google's own retirement error currently points callers to.
+  const MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.7-flash'];
   const errors = [];
 
   for (const model of MODELS) {
