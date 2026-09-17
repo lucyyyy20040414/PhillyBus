@@ -41,7 +41,7 @@ module.exports = async (req, res) => {
   // short list, newest first, and fall through on any failure — only
   // report an error if every one of them fails.
   const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
-  let lastError = null;
+  const errors = [];
 
   for (const model of MODELS) {
     try {
@@ -52,20 +52,24 @@ module.exports = async (req, res) => {
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
       });
 
-      if (!geminiRes.ok) { lastError = model + ' -> ' + geminiRes.status; continue; }
+      if (!geminiRes.ok) {
+        const bodyText = await geminiRes.text().catch(() => '');
+        errors.push(model + ' -> ' + geminiRes.status + ' ' + bodyText.slice(0, 300));
+        continue;
+      }
       const data = await geminiRes.json();
       const text = data && data.candidates && data.candidates[0] &&
         data.candidates[0].content && data.candidates[0].content.parts &&
         data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
 
-      if (!text) { lastError = model + ' -> no text in response'; continue; }
+      if (!text) { errors.push(model + ' -> no text in response: ' + JSON.stringify(data).slice(0, 300)); continue; }
 
       res.status(200).json({ message: text.trim().replace(/^"|"$/g, '').slice(0, 200), model });
       return;
     } catch (err) {
-      lastError = model + ' -> ' + String((err && err.message) || err);
+      errors.push(model + ' -> ' + String((err && err.message) || err));
     }
   }
 
-  res.status(502).json({ error: 'AI generation failed', detail: lastError });
+  res.status(502).json({ error: 'AI generation failed', detail: errors });
 };
