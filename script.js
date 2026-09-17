@@ -150,7 +150,23 @@
     if(live.pollTimer){ clearInterval(live.pollTimer); live.pollTimer = null; }
   }
 
-  // ---------- Alarm sound (Web Audio) ----------
+  // ---------- Stop mnemonic (Web Audio) ----------
+  //
+  // Instead of a generic alarm, the "one stop away" alert plays a
+  // short tune derived from the destination stop's own name — so a
+  // rider learns to recognize their stop by ear over repeat trips,
+  // without looking at the screen.
+  //
+  // This is a deterministic sonification algorithm, not a live
+  // generative-audio model (no such API is wired into this app) —
+  // consistent with how the rest of Philly Bus separates real SEPTA
+  // data from clearly-labeled non-AI application logic. The same
+  // stop name always produces the same notes:
+  //   - each word's syllable count sets how many notes it gets
+  //     (rhythm follows the pronunciation of the name)
+  //   - each word hashes to a note on a pentatonic scale, so the
+  //     tune is always musical — hashing can't produce a "wrong"
+  //     or dissonant note, only a different one
   var audioCtx = null;
   var activeAlarmNodes = [];
   function ensureAudioCtx(){
@@ -164,14 +180,43 @@
     }
     return audioCtx;
   }
-  function playBeep(ctx, startTime, duration, freq){
+
+  // C D E G A across two octaves — a pentatonic scale has no
+  // "clashing" interval, so any combination of these notes sounds
+  // intentional rather than random.
+  var PENTATONIC_HZ = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25, 783.99, 880.00];
+
+  function hashWord(w){
+    var h = 0;
+    for(var i = 0; i < w.length; i++){ h = (h * 31 + w.charCodeAt(i)) >>> 0; }
+    return h;
+  }
+  function countSyllables(word){
+    var m = word.toLowerCase().match(/[aeiouy]+/g);
+    return m ? m.length : 1;
+  }
+  function stopNameToNotes(name){
+    var clean = name.replace(/\s*-\s*[A-Z]{2,5}$/, ''); // strip trailing codes like "- FS"
+    var words = clean.split(/[\s&]+/).filter(Boolean);
+    var notes = [];
+    words.forEach(function(word){
+      var syllables = Math.max(1, Math.min(3, countSyllables(word)));
+      var baseIdx = hashWord(word.toLowerCase()) % PENTATONIC_HZ.length;
+      for(var s = 0; s < syllables; s++){
+        notes.push(PENTATONIC_HZ[(baseIdx + s) % PENTATONIC_HZ.length]);
+      }
+    });
+    return notes.slice(0, 7); // a short cue, not a song
+  }
+
+  function playTone(ctx, startTime, duration, freq){
     var osc = ctx.createOscillator();
     var gain = ctx.createGain();
-    osc.type = 'square';
+    osc.type = 'sine';
     osc.frequency.setValueAtTime(freq, startTime);
     gain.gain.setValueAtTime(0, startTime);
-    gain.gain.linearRampToValueAtTime(0.16, startTime + 0.02);
-    gain.gain.setValueAtTime(0.16, Math.max(startTime + 0.02, startTime + duration - 0.03));
+    gain.gain.linearRampToValueAtTime(0.22, startTime + 0.015);
+    gain.gain.setValueAtTime(0.22, Math.max(startTime + 0.015, startTime + duration - 0.05));
     gain.gain.linearRampToValueAtTime(0, startTime + duration);
     osc.connect(gain);
     gain.connect(ctx.destination);
@@ -183,16 +228,16 @@
       if(idx > -1) activeAlarmNodes.splice(idx, 1);
     });
   }
-  function playAlarm(){
+  function playStopMnemonic(stopName){
     var ctx = ensureAudioCtx();
     if(!ctx) return;
+    var notes = stopNameToNotes(stopName);
+    if(!notes.length) notes = [PENTATONIC_HZ[0], PENTATONIC_HZ[2], PENTATONIC_HZ[4]];
+    var noteDur = 0.16, gap = 0.03;
     var now = ctx.currentTime + 0.03;
-    var pulseGap = 0.7;
-    for(var i=0;i<3;i++){
-      var t = now + i * pulseGap;
-      playBeep(ctx, t, 0.16, 880);
-      playBeep(ctx, t + 0.2, 0.16, 660);
-    }
+    notes.forEach(function(freq, i){
+      playTone(ctx, now + i * (noteDur + gap), noteDur, freq);
+    });
   }
   function stopAlarm(){
     activeAlarmNodes.forEach(function(osc){ try{ osc.stop(); } catch(e){} });
@@ -230,6 +275,7 @@
     changeDestBtn: document.getElementById('changeDestBtn'),
 
     progressHeading: document.getElementById('progressHeading'),
+    progressSub: document.getElementById('progressSub'),
     stoplist: document.getElementById('stoplist'),
     cancelTripBtn: document.getElementById('cancelTripBtn'),
 
@@ -247,6 +293,26 @@
     animId: null,
     animToken: 0
   };
+
+  // ---------- AI-generated trip status line ----------
+  //
+  // Requested once, right when tracking starts, from real numbers already
+  // computed at that moment (destination, minutes out, schedule delay) —
+  // never invented by the model. Gemini's only job is turning those numbers
+  // into one short, human sentence about how to feel about the wait. If
+  // /api/status isn't reachable (no key configured yet, network error), the
+  // subtitle just stays as its plain default — the trip still works exactly
+  // the same either way.
+  var DEFAULT_PROGRESS_SUB = el.progressSub ? el.progressSub.textContent : '';
+  function requestAiStatus(destination, minutesAway, lateMinutes){
+    fetch('/api/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ destination: destination, minutesAway: minutesAway, lateMinutes: lateMinutes })
+    }).then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
+      if(data && data.message && el.progressSub){ el.progressSub.textContent = data.message; }
+    }).catch(function(){ /* subtitle just stays at its default */ });
+  }
 
   // ---------- Live status / detour UI ----------
   function renderStatus(){
@@ -605,8 +671,12 @@
     el.liveRouteName.innerHTML = 'Route ' + live.route + ' · <strong>' + escapeHtml(sel.name) + '</strong>';
     el.topbar.classList.add('is-live');
     el.progressHeading.textContent = 'On Route ' + live.route + ', headed to ' + sel.name;
+    if(el.progressSub) el.progressSub.textContent = DEFAULT_PROGRESS_SUB;
     showPanel('progress');
     updateProgressUI();
+
+    var minutesAway = v ? Math.max(0, Math.round(((sel.seq - v.nextStopSeq) * AVG_SECS_PER_STOP) / 60)) : null;
+    requestAiStatus(sel.name, minutesAway, v ? v.late : null);
   });
 
   function endTrip(){
@@ -637,7 +707,7 @@
     void el.alertOverlay.offsetWidth;
     el.alertOverlay.classList.add('buzz');
     el.alertOverlay.setAttribute('aria-hidden','false');
-    playAlarm();
+    playStopMnemonic(t.name);
     if(document.title.indexOf('Get ready') !== 0){
       document.title = 'Get ready · ' + document.title;
     }
