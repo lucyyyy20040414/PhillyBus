@@ -1,734 +1,442 @@
-(function(){
-  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  // ============================================================
-  // SEPTA live data layer
-  //
-  // SEPTA's public API (https://www3.septa.org/developer/) has no
-  // endpoint for "look up a stop by name" or "predicted arrival at a
-  // bus stop" — only live vehicle positions (TransitView), each with
-  // the vehicle's *next* stop name + a numeric stop sequence. There's
-  // no documented CORS support either (SEPTA's own dev forum points
-  // people at JSONP instead), so every call here goes through a
-  // JSONP <script> tag, not fetch().
-  //
-  // Because there's no full stop catalog to search, this app builds
-  // one itself, live: every vehicle currently running a route reports
-  // {sequence, name} for whatever stop it's about to hit. Poll enough
-  // vehicles over enough time and you get a real, honest map of that
-  // route's stops — with no invented stop IDs.
-  // ============================================================
-
-  var TRANSITVIEW_URL = 'https://www3.septa.org/api/TransitView/index.php';
-  var BUSDETOURS_URL = 'https://www3.septa.org/api/BusDetours/index.php';
-  var POLL_MS = 12000;
-  var JSONP_TIMEOUT_MS = 9000;
-  var AVG_SECS_PER_STOP = 110; // rough, labeled as an estimate everywhere it's shown
-
-  function jsonp(url){
-    return new Promise(function(resolve, reject){
-      var cbName = 'septa_cb_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
-      var script = document.createElement('script');
-      var done = false;
-      var timer = setTimeout(function(){
-        if(done) return;
-        done = true;
-        cleanup();
-        reject(new Error('timeout'));
-      }, JSONP_TIMEOUT_MS);
-
-      function cleanup(){
-        clearTimeout(timer);
-        try{ delete window[cbName]; } catch(e){ window[cbName] = undefined; }
-        if(script.parentNode) script.parentNode.removeChild(script);
-      }
-      window[cbName] = function(data){
-        if(done) return;
-        done = true;
-        cleanup();
-        resolve(data);
-      };
-      script.onerror = function(){
-        if(done) return;
-        done = true;
-        cleanup();
-        reject(new Error('network'));
-      };
-      var sep = url.indexOf('?') > -1 ? '&' : '?';
-      script.src = url + sep + 'callback=' + cbName;
-      document.head.appendChild(script);
-    });
-  }
-
-  function normalizeVehicle(raw){
-    var seq = parseInt(raw.next_stop_sequence, 10);
-    var late = raw.late !== undefined && raw.late !== null && raw.late !== '' ? parseInt(raw.late, 10) : null;
-    return {
-      id: String(raw.VehicleID || raw.label || ''),
-      label: raw.label || raw.VehicleID || '?',
-      direction: raw.Direction || raw.direction || 'Unknown',
-      destination: raw.destination || '',
-      nextStopName: raw.next_stop_name || '',
-      nextStopId: raw.next_stop_id || '',
-      nextStopSeq: seq,
-      late: isNaN(late) ? null : late,
-      lat: parseFloat(raw.lat),
-      lng: parseFloat(raw.lng)
-    };
-  }
-
-  // discoveredStops[direction][sequence] = { name, id, lastSeen }
-  var discoveredStops = {};
-  function mergeDiscovered(vehicles){
-    vehicles.forEach(function(v){
-      if(!v.nextStopName || isNaN(v.nextStopSeq)) return;
-      if(!discoveredStops[v.direction]) discoveredStops[v.direction] = {};
-      discoveredStops[v.direction][v.nextStopSeq] = {
-        name: v.nextStopName, id: v.nextStopId, lastSeen: Date.now()
-      };
-    });
-  }
-  function stopNameFor(direction, seq){
-    var byDir = discoveredStops[direction];
-    return (byDir && byDir[seq]) ? byDir[seq].name : null;
-  }
-
-  var live = {
-    route: '21',
-    vehicles: [],
-    status: 'idle', // idle | loading | ok | empty | error
-    lastUpdated: null,
-    pollTimer: null,
-    detourText: ''
-  };
-
-  function fetchTransitView(route){
-    return jsonp(TRANSITVIEW_URL + '?route=' + encodeURIComponent(route)).then(function(data){
-      var raw = (data && data.bus) ? data.bus : [];
-      return raw.map(normalizeVehicle).filter(function(v){ return v.id; });
-    });
-  }
-  function fetchDetours(route){
-    return jsonp(BUSDETOURS_URL + '?route=' + encodeURIComponent(route))
-      .then(function(data){
-        // Response shape isn't fully documented; be defensive.
-        var list = Array.isArray(data) ? data : (data && data.route_id ? [data] : []);
-        if(!list.length) return '';
-        var reasons = list.map(function(d){ return d.reason || d.route_direction || ''; }).filter(Boolean);
-        return reasons.length ? ('Active detour on Route ' + route + ': ' + reasons[0]) : '';
-      })
-      .catch(function(){ return ''; }); // detours are a nice-to-have, never block on them
-  }
-
-  function refreshLive(){
-    live.status = live.vehicles.length ? live.status : 'loading';
-    renderStatus();
-    fetchTransitView(live.route).then(function(vehicles){
-      live.vehicles = vehicles;
-      mergeDiscovered(vehicles);
-      live.status = vehicles.length ? 'ok' : 'empty';
-      live.lastUpdated = Date.now();
-      renderStatus();
-      renderSuggestions();
-      if(state.tracking) updateTracking();
-    }).catch(function(){
-      live.status = 'error';
-      renderStatus();
-    });
-    fetchDetours(live.route).then(function(text){
-      live.detourText = text;
-      renderDetour();
-    });
-  }
-
-  function startPolling(){
-    stopPolling();
-    refreshLive();
-    live.pollTimer = setInterval(refreshLive, POLL_MS);
-  }
-  function stopPolling(){
-    if(live.pollTimer){ clearInterval(live.pollTimer); live.pollTimer = null; }
-  }
-
-  // ---------- Stop mnemonic (Web Audio) ----------
-  //
-  // Instead of a generic alarm, the "one stop away" alert plays a
-  // short tune derived from the destination stop's own name — so a
-  // rider learns to recognize their stop by ear over repeat trips,
-  // without looking at the screen.
-  //
-  // This is a deterministic sonification algorithm, not a live
-  // generative-audio model (no such API is wired into this app) —
-  // consistent with how the rest of Philly Bus separates real SEPTA
-  // data from clearly-labeled non-AI application logic. The same
-  // stop name always produces the same notes:
-  //   - each word's syllable count sets how many notes it gets
-  //     (rhythm follows the pronunciation of the name)
-  //   - each word hashes to a note on a pentatonic scale, so the
-  //     tune is always musical — hashing can't produce a "wrong"
-  //     or dissonant note, only a different one
-  var audioCtx = null;
-  var activeAlarmNodes = [];
-  function ensureAudioCtx(){
-    var AC = window.AudioContext || window.webkitAudioContext;
-    if(!AC) return null;
-    if(!audioCtx){
-      try{ audioCtx = new AC(); } catch(e){ return null; }
-    }
-    if(audioCtx.state === 'suspended'){
-      audioCtx.resume().catch(function(){});
-    }
-    return audioCtx;
-  }
-
-  // C D E G A across two octaves — a pentatonic scale has no
-  // "clashing" interval, so any combination of these notes sounds
-  // intentional rather than random.
-  var PENTATONIC_HZ = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25, 783.99, 880.00];
-
-  function hashWord(w){
-    var h = 0;
-    for(var i = 0; i < w.length; i++){ h = (h * 31 + w.charCodeAt(i)) >>> 0; }
-    return h;
-  }
-  function countSyllables(word){
-    var m = word.toLowerCase().match(/[aeiouy]+/g);
-    return m ? m.length : 1;
-  }
-  function stopNameToNotes(name){
-    var clean = name.replace(/\s*-\s*[A-Z]{2,5}$/, ''); // strip trailing codes like "- FS"
-    var words = clean.split(/[\s&]+/).filter(Boolean);
-    var notes = [];
-    words.forEach(function(word){
-      var syllables = Math.max(1, Math.min(3, countSyllables(word)));
-      var baseIdx = hashWord(word.toLowerCase()) % PENTATONIC_HZ.length;
-      for(var s = 0; s < syllables; s++){
-        notes.push(PENTATONIC_HZ[(baseIdx + s) % PENTATONIC_HZ.length]);
-      }
-    });
-    return notes.slice(0, 7); // a short cue, not a song
-  }
-
-  function playTone(ctx, startTime, duration, freq){
-    var osc = ctx.createOscillator();
-    var gain = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(freq, startTime);
-    gain.gain.setValueAtTime(0, startTime);
-    gain.gain.linearRampToValueAtTime(0.22, startTime + 0.015);
-    gain.gain.setValueAtTime(0.22, Math.max(startTime + 0.015, startTime + duration - 0.05));
-    gain.gain.linearRampToValueAtTime(0, startTime + duration);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(startTime);
-    osc.stop(startTime + duration + 0.02);
-    activeAlarmNodes.push(osc);
-    osc.addEventListener('ended', function(){
-      var idx = activeAlarmNodes.indexOf(osc);
-      if(idx > -1) activeAlarmNodes.splice(idx, 1);
-    });
-  }
-  function playStopMnemonic(stopName){
-    var ctx = ensureAudioCtx();
-    if(!ctx) return;
-    var notes = stopNameToNotes(stopName);
-    if(!notes.length) notes = [PENTATONIC_HZ[0], PENTATONIC_HZ[2], PENTATONIC_HZ[4]];
-    var noteDur = 0.16, gap = 0.03;
-    var now = ctx.currentTime + 0.03;
-    notes.forEach(function(freq, i){
-      playTone(ctx, now + i * (noteDur + gap), noteDur, freq);
-    });
-  }
-  function stopAlarm(){
-    activeAlarmNodes.forEach(function(osc){ try{ osc.stop(); } catch(e){} });
-    activeAlarmNodes = [];
-  }
+/* UI + flow:  ENTER ROUTE → CHOOSE DIRECTION → CHOOSE INTEREST → RIDE.
+   The route's ordered stops come from data/routes/*.json; the rider's GPS position is
+   placed on that route; landmarks near the stops ahead come from /api/landmarks.
+   All the "is a landmark coming up" logic lives in js/ride.js; this file only moves
+   between screens and paints what the engine reports. */
+(function () {
+  var PB = window.PB;
+  var $ = function (id) { return document.getElementById(id); };
 
   var el = {
-    topbar: document.getElementById('topbar'),
-    trackFill: document.getElementById('trackFill'),
-    trackStops: document.getElementById('trackStops'),
-    trackBus: document.getElementById('trackBus'),
-    liveRouteName: document.getElementById('liveRouteName'),
-    liveEta: document.getElementById('liveEta'),
-    endTripBtn: document.getElementById('endTripBtn'),
-
-    routeInput: document.getElementById('routeInput'),
-    liveStatus: document.getElementById('liveStatus'),
-    detourBanner: document.getElementById('detourBanner'),
-
-    searchInput: document.getElementById('searchInput'),
-    micBtn: document.getElementById('micBtn'),
-    voiceNote: document.getElementById('voiceNote'),
-    suggLabel: document.getElementById('suggLabel'),
-    suggList: document.getElementById('suggList'),
-    confirmBtn: document.getElementById('confirmBtn'),
-
-    panelSearch: document.getElementById('panelSearch'),
-    panelConfirm: document.getElementById('panelConfirm'),
-    panelProgress: document.getElementById('panelProgress'),
-
-    tripStop: document.getElementById('tripStop'),
-    tripVehicle: document.getElementById('tripVehicle'),
-    tripLive: document.getElementById('tripLive'),
-    startTripBtn: document.getElementById('startTripBtn'),
-    changeDestBtn: document.getElementById('changeDestBtn'),
-
-    progressHeading: document.getElementById('progressHeading'),
-    progressSub: document.getElementById('progressSub'),
-    stoplist: document.getElementById('stoplist'),
-    cancelTripBtn: document.getElementById('cancelTripBtn'),
-
-    alertOverlay: document.getElementById('alertOverlay'),
-    alertStop: document.getElementById('alertStop'),
-    keepTrackingBtn: document.getElementById('keepTrackingBtn'),
-    endFromAlertBtn: document.getElementById('endFromAlertBtn'),
-
-    resetDemoBtn: document.getElementById('resetDemoBtn')
+    routeForm: $('routeForm'), routeInput: $('routeInput'), routeBtn: $('routeBtn'), routeNote: $('routeNote'),
+    dirBullet: $('dirBullet'), dirName: $('dirName'), dirList: $('dirList'), dirBack: $('dirBack'),
+    interestBullet: $('interestBullet'), interestGrid: $('interestGrid'),
+    ride: $('screenRide'), rideBullet: $('rideBullet'), rideDir: $('rideDir'), rideInterest: $('rideInterest'),
+    soundBtn: $('soundBtn'), endRideBtn: $('endRideBtn'), locRoute: $('locRoute'),
+    pickTitle: $('pickTitle'), pickNote: $('pickNote'), pickList: $('pickList'), pickRetry: $('pickRetry'),
+    calmSub: $('calmSub'), rideNext: $('rideNext'),
+    card: $('card'), cardPhoto: $('cardPhoto'), cardImg: $('cardImg'), cardNone: $('cardNone'), cardCredit: $('cardCredit'),
+    look: $('look'), lookText: $('lookText'), cardName: $('cardName'), cardStop: $('cardStop'), cardKind: $('cardKind'),
+    cardWhen: $('cardWhen'), cardWhy: $('cardWhy'), cardAi: $('cardAi')
   };
 
+  var GPS_ON_ROUTE_M = 120; // first fix must be this close to the chosen direction's route
   var state = {
-    selected: null,   // { name, direction, seq }
-    tracking: null,   // { name, direction, seq, startSeq, vehicleId, lost }
-    animId: null,
-    animToken: 0
+    route: '', doc: null, dir: null, interest: null,
+    engine: null, watchId: null, vehTimer: null, simTimer: null,
+    token: 0, lastCardId: null, wrongWay: 0
   };
+  var soundOn = true;
+  try { soundOn = localStorage.getItem('pb.sound') !== 'off'; } catch (e) {}
 
-  // ---------- AI-generated trip status line ----------
-  //
-  // Requested once, right when tracking starts, from real numbers already
-  // computed at that moment (destination, minutes out, schedule delay) —
-  // never invented by the model. Gemini's only job is turning those numbers
-  // into one short, human sentence about how to feel about the wait. If
-  // /api/status isn't reachable (no key configured yet, network error), the
-  // subtitle just stays as its plain default — the trip still works exactly
-  // the same either way.
-  var DEFAULT_PROGRESS_SUB = el.progressSub ? el.progressSub.textContent : '';
-  function requestAiStatus(destination, minutesAway, lateMinutes){
-    fetch('/api/status', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ destination: destination, minutesAway: minutesAway, lateMinutes: lateMinutes })
-    }).then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
-      if(data && data.message && el.progressSub){ el.progressSub.textContent = data.message; }
-    }).catch(function(){ /* subtitle just stays at its default */ });
+  /* ---------- screens ---------- */
+  var SCREENS = { route: 'screenRoute', dir: 'screenDir', interest: 'screenInterest', ride: 'screenRide' };
+  function show(name) {
+    document.body.dataset.screen = name;
+    Object.keys(SCREENS).forEach(function (n) { $(SCREENS[n]).classList.toggle('active', n === name); });
+    window.scrollTo(0, 0);
+  }
+  function setRideState(s) { if (el.ride.dataset.state !== s) el.ride.dataset.state = s; }
+  function note(msg, isErr) {
+    el.routeNote.textContent = msg || '';
+    el.routeNote.classList.toggle('form-note--err', !!isErr);
   }
 
-  // ---------- Live status / detour UI ----------
-  function renderStatus(){
-    var txt;
-    if(live.status === 'loading') txt = 'Connecting to SEPTA…';
-    else if(live.status === 'error') txt = 'Couldn’t reach SEPTA’s live data — retrying…';
-    else if(live.status === 'empty') txt = 'No buses currently reporting on Route ' + live.route;
-    else if(live.status === 'ok') txt = 'Live · Route ' + live.route + ' · ' + live.vehicles.length + ' bus' + (live.vehicles.length === 1 ? '' : 'es') + ' reporting';
-    else txt = '';
-    el.liveStatus.textContent = txt;
-    el.liveStatus.classList.toggle('err', live.status === 'error');
-  }
-  function renderDetour(){
-    if(live.detourText){
-      el.detourBanner.textContent = live.detourText;
-      el.detourBanner.hidden = false;
-    } else {
-      el.detourBanner.hidden = true;
-    }
+  /* ---------- 1 · route ---------- */
+  // Resolves { doc } once the route's stops and shape are loaded, or false.
+  function lookupRoute(raw) {
+    var q = PB.route.normalize(raw);
+    if (!q) { note('Type the number on the front of your bus.', true); return Promise.resolve(false); }
+    el.routeBtn.disabled = true;
+    note('Looking up Route ' + q + '…');
+    return PB.route.lookup(q).then(function (info) {
+      if (!info) {
+        note("We couldn't find a SEPTA bus route \"" + q + '". Check the number on the front of the bus.', true);
+        return false;
+      }
+      return PB.route.load(info).then(function (doc) {
+        state.route = info.route;
+        state.doc = doc;
+        try { localStorage.setItem('pb.route', info.route); } catch (e) {}
+        note('');
+        return true;
+      });
+    }).catch(function () {
+      note("Couldn't load that route just now. Try again in a moment.", true);
+      return false;
+    }).then(function (ok) { el.routeBtn.disabled = false; return ok; });
   }
 
-  // ---------- Search / suggestions (built from live SEPTA data) ----------
-  function collectStops(){
-    var out = [];
-    Object.keys(discoveredStops).forEach(function(direction){
-      var seqs = discoveredStops[direction];
-      Object.keys(seqs).forEach(function(seqStr){
-        var seq = parseInt(seqStr, 10);
-        var entry = seqs[seqStr];
-        var approachingVehicle = nearestApproachingVehicle(direction, seq);
-        out.push({
-          name: entry.name,
-          direction: direction,
-          seq: seq,
-          approaching: !!approachingVehicle,
-          etaMin: approachingVehicle ? Math.max(1, Math.round(((seq - approachingVehicle.nextStopSeq) * AVG_SECS_PER_STOP) / 60)) : null
+  /* ---------- 2 · direction ---------- */
+  var CARDINAL = { north: 0, east: 90, south: 180, west: 270 };
+  function dirAngle(d) {
+    var m = /^(north|east|south|west)/i.exec(d.label || '');
+    if (m) return CARDINAL[m[1].toLowerCase()];
+    var a = d.shape[0], b = d.shape[d.shape.length - 1];
+    return PB.geo.bearing({ lat: a[0], lng: a[1] }, { lat: b[0], lng: b[1] });
+  }
+  function dirTitle(d) { return d.label || ('To ' + (d.to || d.headsign || 'end of line')); }
+
+  function fillDirections() {
+    el.dirBullet.textContent = state.route;
+    el.dirName.textContent = state.doc.name || 'SEPTA Route ' + state.route;
+    el.dirList.innerHTML = '';
+    state.doc.dirs.forEach(function (d) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'dir-btn';
+      b.innerHTML = '<span class="dir-btn__arrow" style="transform:rotate(' + Math.round(dirAngle(d) - 90) + 'deg)">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h17M13 5l7 7-7 7"/></svg></span>' +
+        '<span class="dir-btn__txt"><strong></strong><span></span></span>';
+      b.querySelector('strong').textContent = dirTitle(d);
+      b.querySelector('.dir-btn__txt span').textContent = d.label && d.to ? 'to ' + d.to : (d.stops.length + ' stops');
+      b.addEventListener('click', function () { chooseDir(d); });
+      el.dirList.appendChild(b);
+    });
+  }
+
+  function chooseDir(d) {
+    state.dir = d;
+    buildInterests();
+    el.interestBullet.textContent = state.route;
+    show('interest');
+  }
+
+  // Straight from the route screen: one-direction routes skip the direction question.
+  function afterRoute() {
+    if (state.doc.dirs.length === 1) { chooseDir(state.doc.dirs[0]); return; }
+    fillDirections();
+    show('dir');
+  }
+
+  /* ---------- 3 · interest ---------- */
+  function buildInterests() {
+    if (el.interestGrid.children.length) return;
+    PB.INTERESTS.forEach(function (it) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tile';
+      b.style.setProperty('--c', it.color);
+      b.innerHTML = it.icon + '<span>' + it.label + '</span>';
+      b.addEventListener('click', function () { chooseInterest(it.key); });
+      el.interestGrid.appendChild(b);
+    });
+  }
+
+  function chooseInterest(key, simFrom) {
+    var it = PB.interestByKey(key);
+    if (!it) return;
+    state.interest = it;
+    document.documentElement.style.setProperty('--accent', it.color);
+    unlockAudio(); // this tap is the user gesture that lets the chime play later
+    el.rideBullet.textContent = state.route;
+    el.locRoute.textContent = 'Route ' + state.route;
+    el.rideInterest.textContent = it.label;
+    el.rideDir.textContent = dirTitle(state.dir) + (state.dir.label && state.dir.to ? ' · to ' + state.dir.to : '');
+    el.rideNext.textContent = state.doc.name || 'Route ' + state.route;
+    el.cardNone.innerHTML = it.icon;
+    show('ride');
+    if (simFrom !== undefined) startSimulated(simFrom); else startLocating();
+  }
+
+  /* ---------- 4 · ride: place the rider on the route ---------- */
+  function stopTracking() {
+    state.token++;
+    if (state.engine) { state.engine.stop(); state.engine = null; }
+    if (state.watchId !== null) { navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
+    clearInterval(state.vehTimer); state.vehTimer = null;
+    clearInterval(state.simTimer); state.simTimer = null;
+    state.lastCardId = null;
+    state.wrongWay = 0;
+  }
+
+  function getUserPosition() {
+    return new Promise(function (resolve) {
+      if (!navigator.geolocation) { resolve(null); return; }
+      var done = false;
+      var timer = setTimeout(function () { if (!done) { done = true; resolve(null); } }, 9000);
+      navigator.geolocation.getCurrentPosition(function (p) {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        resolve({ lat: p.coords.latitude, lng: p.coords.longitude });
+      }, function () {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        resolve(null);
+      }, { enableHighAccuracy: true, timeout: 8000, maximumAge: 15000 });
+    });
+  }
+
+  function startLocating() {
+    stopTracking();
+    setRideState('locating');
+    var token = state.token;
+    getUserPosition().then(function (user) {
+      if (token !== state.token) return; // rider ended the ride or started over
+      var sn = user ? PB.route.snap(state.dir, user.lat, user.lng, null) : null;
+      if (sn && sn.dist <= GPS_ON_ROUTE_M) { trackGps(); return; }
+      startVehicleFallback(token, user ? "You don't seem to be on this route right now." : 'Location is off, so tell us which bus you\'re on.');
+    });
+  }
+
+  function newEngine() {
+    return PB.ride.start({ route: state.route, dir: state.dir, interest: state.interest.key, onFrame: onFrame });
+  }
+
+  // Main path: the rider's own phone, riding along.
+  function trackGps() {
+    var token = state.token;
+    setRideState('calm');
+    el.calmSub.textContent = 'Getting your location…';
+    state.engine = newEngine();
+    state.watchId = navigator.geolocation.watchPosition(function (p) {
+      if (token !== state.token || !state.engine) return;
+      var c = p.coords;
+      state.engine.feed({ lat: c.latitude, lng: c.longitude, speed: typeof c.speed === 'number' && isFinite(c.speed) ? c.speed : null });
+      checkWrongWay(c);
+    }, function () {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+    keepAwake();
+  }
+
+  // Moving fast the opposite way to the chosen direction, several fixes in a row?
+  function checkWrongWay(c) {
+    if (typeof c.heading !== 'number' || !isFinite(c.heading) || !(c.speed > 3)) { state.wrongWay = 0; return; }
+    var sn = PB.route.snap(state.dir, c.latitude, c.longitude, state.engine.position());
+    if (sn && sn.dist < GPS_ON_ROUTE_M && PB.geo.angleDiff(c.heading, sn.bearing) > 130) state.wrongWay++;
+    else state.wrongWay = 0;
+  }
+
+  // Fallback: no usable GPS. Let the rider pick their bus from SEPTA's live list for this direction.
+  function startVehicleFallback(token, message) {
+    PB.septa.vehicles(state.route).then(function (vs) { return { vs: vs }; }, function () { return { vs: [], failed: true }; })
+      .then(function (r) {
+        if (token !== state.token) return;
+        var mine = r.vs.filter(function (v) {
+          var sn = PB.route.snap(state.dir, v.lat, v.lng, null);
+          if (!sn || sn.dist > 100) return false;
+          v.snapS = sn.s;
+          return v.heading === null || PB.geo.angleDiff(v.heading, sn.bearing) <= 90;
         });
+        showPicker(mine, r.failed ? "Couldn't reach SEPTA just now." : mine.length ? message : 'No Route ' + state.route + ' ' + (state.dir.label || 'buses') + ' are reporting right now.');
       });
-    });
-    out.sort(function(a, b){
-      if(a.approaching !== b.approaching) return a.approaching ? -1 : 1;
-      if(a.direction !== b.direction) return a.direction < b.direction ? -1 : 1;
-      return a.seq - b.seq;
-    });
-    return out;
-  }
-  function nearestApproachingVehicle(direction, targetSeq){
-    var best = null, bestGap = Infinity;
-    live.vehicles.forEach(function(v){
-      if(v.direction !== direction) return;
-      var gap = targetSeq - v.nextStopSeq;
-      if(gap >= 0 && gap < bestGap){ bestGap = gap; best = v; }
-    });
-    return best;
   }
 
-  function renderSuggestions(){
-    var q = el.searchInput.value.trim().toLowerCase();
-    var all = collectStops();
-    var filtered = q ? all.filter(function(s){ return s.name.toLowerCase().indexOf(q) > -1; }) : all;
-    el.suggLabel.textContent = 'Live stops on Route ' + live.route + (filtered.length ? '' : ' — none yet');
-
-    el.suggList.innerHTML = '';
-    if(filtered.length === 0){
+  function showPicker(vs, message) {
+    el.pickTitle.textContent = vs.length ? 'Pick your bus' : 'No bus yet';
+    el.pickNote.textContent = message || '';
+    el.pickList.innerHTML = '';
+    vs.slice().sort(function (a, b) { return a.snapS - b.snapS; }).slice(0, 8).forEach(function (v) {
       var li = document.createElement('li');
-      var msg = live.status === 'loading' || live.status === 'idle'
-        ? 'Loading live stops from SEPTA…'
-        : (q ? 'No live stop matches “' + q + '” yet — try a shorter cross-street, or wait for more buses to report.'
-              : 'No stops discovered yet for Route ' + live.route + ' — give it a few seconds.');
-      li.innerHTML = '<div class="no-match">' + msg + '</div>';
-      el.suggList.appendChild(li);
-      return;
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pick-btn';
+      var ns = PB.route.nextStop(state.dir, v.snapS);
+      var strong = document.createElement('strong');
+      strong.textContent = 'Bus ' + v.label;
+      var span = document.createElement('span');
+      span.textContent = ns ? 'Next stop · ' + ns.n : 'Near the end of the line';
+      b.appendChild(strong); b.appendChild(span);
+      b.addEventListener('click', function () { trackVehicle(v); });
+      li.appendChild(b);
+      el.pickList.appendChild(li);
+    });
+    setRideState('pick');
+  }
+
+  function trackVehicle(v) {
+    var token = state.token;
+    var lastTs = null, misses = 0;
+    setRideState('calm');
+    el.calmSub.textContent = 'Watching the road ahead.';
+    state.engine = newEngine();
+    state.engine.feed({ lat: v.lat, lng: v.lng, speed: null });
+    lastTs = v.ts;
+    state.vehTimer = setInterval(function () {
+      PB.septa.vehicles(state.route).then(function (list) {
+        if (token !== state.token || !state.engine) return;
+        var cur = null;
+        for (var i = 0; i < list.length; i++) if (list[i].id === v.id) { cur = list[i]; break; }
+        if (!cur) { if (++misses >= 3) startLocating(); return; }
+        misses = 0;
+        if (cur.ts !== lastTs) { lastTs = cur.ts; state.engine.feed({ lat: cur.lat, lng: cur.lng, speed: null }); } // only real new reports
+      }).catch(function () {});
+    }, 10000);
+    keepAwake();
+  }
+
+  // Demo/testing: ?sim=<meters along the route> rides a pretend bus from that point at ~27 mph.
+  function pointAt(dir, m) {
+    var cum = dir.cum, i = 0;
+    m = Math.max(0, Math.min(cum[cum.length - 1], m));
+    while (i < cum.length - 2 && cum[i + 1] < m) i++;
+    var span = cum[i + 1] - cum[i], t = span > 0 ? (m - cum[i]) / span : 0;
+    var a = dir.shape[i], b = dir.shape[i + 1];
+    return { lat: a[0] + t * (b[0] - a[0]), lng: a[1] + t * (b[1] - a[1]) };
+  }
+  function startSimulated(fromM) {
+    stopTracking();
+    setRideState('calm');
+    el.calmSub.textContent = 'Demo ride.';
+    state.engine = newEngine();
+    var m = fromM, V = 12;
+    var step = function () {
+      var p = pointAt(state.dir, m);
+      state.engine.feed({ lat: p.lat, lng: p.lng, speed: V });
+      m += V;
+    };
+    step();
+    state.simTimer = setInterval(step, 1000);
+  }
+
+  /* ---------- painting engine frames ---------- */
+  function onFrame(f) {
+    el.rideNext.textContent = f.nextStop ? 'Next stop · ' + f.nextStop : (state.doc.name || 'Route ' + state.route);
+    if (f.mode === 'card') {
+      renderCard(f.card, f.fresh);
+      setRideState('card');
+    } else {
+      el.calmSub.textContent = !f.hasFix ? 'Getting your location…'
+        : f.atEnd ? 'End of the line. Thanks for riding!'
+        : f.offRoute ? "You're off Route " + state.route + ' right now.'
+        : f.stale ? 'Waiting for a location update…'
+        : state.wrongWay >= 3 ? 'Looks like you\'re heading the other way. Tap End and pick the other direction.'
+        : f.nextMin ? 'Next discovery in ~' + f.nextMin + ' min.'
+        : f.loading ? 'Scanning ahead…'
+        : 'Watching the road ahead.';
+      setRideState('calm');
     }
-    filtered.slice(0, 25).forEach(function(s){
-      var li = document.createElement('li');
-      var pressed = state.selected && state.selected.name === s.name && state.selected.direction === s.direction;
-      var sub = s.direction + (s.approaching ? ' · next bus ~' + s.etaMin + ' min (est.)' : ' · no bus approaching right now');
-      li.innerHTML =
-        '<button class="sugg-btn" aria-pressed="' + (pressed ? 'true' : 'false') + '">' +
-          '<span class="sugg-ico"><span class="live-dot ' + (s.approaching ? 'on' : '') + '"></span></span>' +
-          '<span class="sugg-text"><strong>' + escapeHtml(s.name) + '</strong><span>' + escapeHtml(sub) + '</span></span>' +
-        '</button>';
-      li.querySelector('button').addEventListener('click', function(){
-        state.selected = { name: s.name, direction: s.direction, seq: s.seq };
-        el.confirmBtn.disabled = false;
-        renderSuggestions();
-      });
-      el.suggList.appendChild(li);
-    });
-  }
-  function escapeHtml(str){
-    return String(str).replace(/[&<>"']/g, function(c){
-      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
-    });
   }
 
-  el.searchInput.addEventListener('input', renderSuggestions);
-  el.routeInput.addEventListener('change', function(){
-    var v = el.routeInput.value.trim();
-    if(!v) v = '21';
-    live.route = v;
-    discoveredStops = {};
-    state.selected = null;
-    el.confirmBtn.disabled = true;
-    el.searchInput.value = '';
-    startPolling();
+  function whenLabel(c) {
+    if (c.distanceM < 40) return 'Right now';
+    var s = Math.round(c.etaSec / 5) * 5;
+    var t = s < 10 ? '~5 sec' : s < 90 ? '~' + s + ' sec' : '~' + Math.round(s / 60) + ' min';
+    return t + ' · ' + PB.geo.feetLabel(c.distanceM);
+  }
+
+  function renderCard(c, fresh) {
+    if (c.id !== state.lastCardId) {
+      state.lastCardId = c.id;
+      el.cardName.textContent = c.name;
+      el.cardStop.textContent = c.stop ? 'By the ' + c.stop + ' stop' : '';
+      el.cardKind.textContent = c.kind;
+      el.cardWhy.textContent = c.sentence;
+      el.cardAi.hidden = !c.ai;
+      el.cardImg.onerror = function () { el.cardPhoto.classList.add('no-photo'); };
+      if (c.photo) {
+        el.cardPhoto.classList.remove('no-photo');
+        el.cardImg.src = c.photo;
+        el.cardCredit.textContent = 'Photo: ' + (c.credit || 'Wikipedia');
+      } else {
+        el.cardPhoto.classList.add('no-photo');
+        el.cardImg.removeAttribute('src');
+      }
+      el.card.classList.remove('pop');
+      void el.card.offsetWidth; // restart the pop-in animation
+      el.card.classList.add('pop');
+    }
+    el.look.className = 'look look--' + c.side;
+    el.lookText.textContent = 'LOOK ' + c.side.toUpperCase();
+    el.cardWhen.textContent = whenLabel(c);
+    if (fresh) alertRider();
+  }
+
+  /* ---------- nudge: chime + buzz ---------- */
+  var audioCtx = null;
+  function unlockAudio() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+    } catch (e) {}
+  }
+  function tone(freq, start, dur) {
+    var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, start);
+    g.gain.linearRampToValueAtTime(0.25, start + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, start + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(start); o.stop(start + dur + 0.05);
+  }
+  function alertRider() {
+    // browsers only allow vibration after the page has been tapped at least once
+    var tapped = !navigator.userActivation || navigator.userActivation.hasBeenActive;
+    if (navigator.vibrate && tapped) navigator.vibrate([140, 70, 140]);
+    if (soundOn && audioCtx && audioCtx.state === 'running') {
+      var t = audioCtx.currentTime + 0.02;
+      tone(880, t, 0.28);
+      tone(1318.5, t + 0.16, 0.45);
+    }
+  }
+
+  var ICON_ON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.500 9a4 4 0 0 1 0 6M19 6.500a8 8 0 0 1 0 11"/></svg>';
+  var ICON_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 9.500l5 5M22 9.500l-5 5"/></svg>';
+  function paintSound() {
+    el.soundBtn.innerHTML = soundOn ? ICON_ON : ICON_OFF;
+    el.soundBtn.setAttribute('aria-pressed', String(soundOn));
+    el.soundBtn.setAttribute('aria-label', soundOn ? 'Sound on' : 'Sound off');
+  }
+  el.soundBtn.addEventListener('click', function () {
+    soundOn = !soundOn;
+    try { localStorage.setItem('pb.sound', soundOn ? 'on' : 'off'); } catch (e) {}
+    if (soundOn) unlockAudio();
+    paintSound();
   });
 
-  // ---------- Voice search (Web Speech API) ----------
-  function matchStopFromSpeech(transcript){
-    var q = transcript.toLowerCase().trim();
-    var all = collectStops();
-    var i, s;
-    for(i=0;i<all.length;i++){
-      s = all[i];
-      var name = s.name.toLowerCase();
-      if(q.indexOf(name) > -1 || name.indexOf(q) > -1) return s;
-    }
-    var words = q.split(/\s+/).filter(function(w){ return w.length > 1; });
-    var best = null, bestScore = 0;
-    for(i=0;i<all.length;i++){
-      s = all[i];
-      var hay = s.name.toLowerCase();
-      var score = 0;
-      for(var j=0;j<words.length;j++){ if(hay.indexOf(words[j]) > -1) score++; }
-      if(score > bestScore){ bestScore = score; best = s; }
-    }
-    return bestScore > 0 ? best : null;
+  /* ---------- keep the screen awake while riding ---------- */
+  var wake = null;
+  function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && !wake) {
+        navigator.wakeLock.request('screen').then(function (l) {
+          wake = l;
+          l.addEventListener('release', function () { wake = null; });
+        }).catch(function () {});
+      }
+    } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && document.body.dataset.screen === 'ride') keepAwake();
+  });
+
+  /* ---------- end / back ---------- */
+  function endRide() {
+    stopTracking();
+    if (wake) { try { wake.release(); } catch (e) {} wake = null; }
+    show('route');
   }
 
-  var SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-  var recognition = null;
-  var listening = false;
+  /* ---------- wiring ---------- */
+  el.routeForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    lookupRoute(el.routeInput.value).then(function (ok) { if (ok) afterRoute(); });
+  });
+  el.dirBack.addEventListener('click', function () { show('route'); el.routeInput.focus(); });
+  el.endRideBtn.addEventListener('click', endRide);
+  el.pickRetry.addEventListener('click', startLocating);
 
-  function setVoiceNote(text, isErr){
-    el.voiceNote.textContent = text || '';
-    el.voiceNote.classList.toggle('err', !!isErr);
-  }
+  paintSound();
 
-  if(SpeechRecognitionCtor){
-    recognition = new SpeechRecognitionCtor();
-    recognition.lang = 'en-US';
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 3;
-
-    recognition.addEventListener('start', function(){
-      listening = true;
-      el.micBtn.classList.add('listening');
-      el.micBtn.setAttribute('aria-label', 'Listening — say your stop');
-      setVoiceNote('Listening… say a cross-street or stop name');
-    });
-    recognition.addEventListener('end', function(){
-      listening = false;
-      el.micBtn.classList.remove('listening');
-      el.micBtn.setAttribute('aria-label', 'Voice search');
-    });
-    recognition.addEventListener('error', function(e){
-      listening = false;
-      el.micBtn.classList.remove('listening');
-      if(e.error === 'not-allowed' || e.error === 'service-not-allowed'){
-        setVoiceNote('Microphone access was blocked — allow it to use voice search.', true);
-      } else if(e.error === 'no-speech'){
-        setVoiceNote('Didn\'t catch that — try again.', true);
-      } else {
-        setVoiceNote('Voice search error: ' + e.error, true);
-      }
-    });
-    recognition.addEventListener('result', function(e){
-      var transcript = e.results[0][0].transcript;
-      el.searchInput.value = transcript;
-      renderSuggestions();
-      var match = matchStopFromSpeech(transcript);
-      if(match){
-        state.selected = { name: match.name, direction: match.direction, seq: match.seq };
-        el.confirmBtn.disabled = false;
-        renderSuggestions();
-        setVoiceNote('Heard "' + transcript + '" — matched ' + match.name + '.');
-      } else {
-        setVoiceNote('Heard "' + transcript + '" — no live match yet, try again or pick from the list.', true);
-      }
+  // Deep links for demos: ?route=42 pre-fills; add &dir=0&interest=food to jump into the ride;
+  // add &sim=9500 to ride a pretend bus from 9,500 m along the route (no GPS needed).
+  var qs = new URLSearchParams(location.search);
+  var qRoute = qs.get('route'), qDir = qs.get('dir'), qInterest = qs.get('interest'), qSim = qs.get('sim');
+  if (qRoute) {
+    el.routeInput.value = qRoute;
+    lookupRoute(qRoute).then(function (ok) {
+      if (!ok) return;
+      var d = qDir !== null ? state.doc.dirs.filter(function (x) { return String(x.id) === qDir; })[0] : null;
+      if (d && PB.interestByKey(qInterest)) {
+        chooseDir(d);
+        var sim = qSim !== null && isFinite(Number(qSim)) ? Number(qSim) : undefined;
+        chooseInterest(qInterest, sim);
+      } else if (d) chooseDir(d);
+      else afterRoute();
     });
   } else {
-    el.micBtn.classList.add('unsupported');
-    el.micBtn.title = 'Voice search not supported in this browser';
+    try { var last = localStorage.getItem('pb.route'); if (last) el.routeInput.value = last; } catch (e) {}
   }
-
-  el.micBtn.addEventListener('click', function(){
-    if(!recognition){
-      setVoiceNote('Voice search isn\'t supported in this browser — try Chrome.', true);
-      return;
-    }
-    if(listening){ recognition.stop(); return; }
-    ensureAudioCtx();
-    setVoiceNote('');
-    try{ recognition.start(); }
-    catch(e){ /* already-started guard */ }
-  });
-
-  // ---------- Confirm ----------
-  el.confirmBtn.addEventListener('click', function(){
-    if(!state.selected) return;
-    populateConfirm();
-    showPanel('confirm');
-  });
-  el.changeDestBtn.addEventListener('click', function(){ showPanel('search'); });
-
-  function populateConfirm(){
-    var sel = state.selected;
-    el.tripStop.textContent = sel.name;
-    var v = nearestApproachingVehicle(sel.direction, sel.seq);
-    if(v){
-      el.tripVehicle.textContent = 'Bus #' + v.label;
-      el.tripLive.textContent = describeVehicle(v) + ' · about ' + Math.max(1, Math.round(((sel.seq - v.nextStopSeq) * AVG_SECS_PER_STOP) / 60)) + ' min out (est.)';
-    } else {
-      el.tripVehicle.textContent = 'Watching for a bus…';
-      el.tripLive.textContent = 'No live bus is heading that way yet — we’ll lock onto one the moment SEPTA reports it.';
-    }
-  }
-  function describeVehicle(v){
-    var onTime = v.late === null ? 'schedule adherence unknown' :
-      (v.late > 0 ? v.late + ' min behind schedule' : (v.late < 0 ? Math.abs(v.late) + ' min ahead of schedule' : 'on schedule'));
-    return 'Next stop: ' + (v.nextStopName || '—') + ' · ' + onTime;
-  }
-
-  // ---------- Trip tracking (real, poll-driven — no fake animation) ----------
-  function buildTrackTicks(n){
-    el.trackStops.innerHTML = '';
-    n = Math.max(1, Math.min(40, n));
-    for(var i=0;i<n;i++) el.trackStops.appendChild(document.createElement('i'));
-  }
-
-  function renderStopList(){
-    var t = state.tracking;
-    el.stoplist.innerHTML = '';
-    if(!t) return;
-    var from = t.startSeq !== null ? t.startSeq : t.seq;
-    var span = Math.max(1, t.seq - from);
-    var rows = Math.min(span + 1, 30);
-    var step = span / (rows - 1 || 1);
-    var currentSeq = t.vehicleId ? currentTrackedSeq() : from;
-
-    for(var i=0;i<rows;i++){
-      var isDest = i === rows - 1;
-      var seq = isDest ? t.seq : Math.round(from + i * step);
-      var name = stopNameFor(t.direction, seq) || (isDest ? t.name : 'Stop #' + seq);
-      var li = document.createElement('li');
-      var cls = '';
-      if(currentSeq !== null){
-        if(seq < currentSeq) cls = 'passed';
-        else if(seq === currentSeq) cls = 'current';
-      }
-      if(isDest) cls += ' dest';
-      li.className = cls.trim();
-      li.innerHTML =
-        '<span class="dot"></span>' +
-        '<span class="name">' + escapeHtml(name) + (isDest ? ' — get off here' : '') + '</span>' +
-        '<span class="eta-tag"></span>';
-      el.stoplist.appendChild(li);
-    }
-  }
-
-  function currentTrackedSeq(){
-    var t = state.tracking;
-    if(!t || !t.vehicleId) return null;
-    var v = findVehicleById(t.vehicleId);
-    return v ? v.nextStopSeq : null;
-  }
-  function findVehicleById(id){
-    for(var i=0;i<live.vehicles.length;i++){
-      if(live.vehicles[i].id === id) return live.vehicles[i];
-    }
-    return null;
-  }
-
-  function updateProgressUI(){
-    var t = state.tracking;
-    if(!t) return;
-    var from = t.startSeq !== null ? t.startSeq : t.seq;
-    var span = Math.max(1, t.seq - from);
-    var v = t.vehicleId ? findVehicleById(t.vehicleId) : null;
-
-    if(!v && t.vehicleId){
-      // tracked vehicle dropped out of the feed
-      el.liveEta.textContent = 'lost bus';
-      return;
-    }
-    if(!v){
-      el.liveEta.textContent = 'watching…';
-      el.trackFill.style.width = '0%';
-      el.trackBus.style.left = '0%';
-      return;
-    }
-    var done = Math.min(span, Math.max(0, v.nextStopSeq - from));
-    var p = done / span;
-    el.trackFill.style.width = (p * 100) + '%';
-    el.trackBus.style.left = (p * 100) + '%';
-    var ticks = el.trackStops.children;
-    var passedTicks = Math.round(p * ticks.length);
-    for(var i=0;i<ticks.length;i++) ticks[i].classList.toggle('passed', i < passedTicks);
-
-    var stopsLeft = Math.max(0, t.seq - v.nextStopSeq);
-    var minLeft = Math.max(0, Math.round((stopsLeft * AVG_SECS_PER_STOP) / 60));
-    el.liveEta.textContent = (v.late !== null ? (v.late > 0 ? v.late + 'm late' : (v.late < 0 ? Math.abs(v.late) + 'm early' : 'on time')) + ' · ' : '') + '~' + minLeft + ' min';
-
-    renderStopList();
-
-    if(v.nextStopSeq >= t.seq){
-      triggerAlert();
-    }
-  }
-
-  function updateTracking(){
-    var t = state.tracking;
-    if(!t) return;
-
-    if(!t.vehicleId){
-      var candidate = nearestApproachingVehicle(t.direction, t.seq);
-      if(candidate){
-        t.vehicleId = candidate.id;
-        t.startSeq = candidate.nextStopSeq;
-        buildTrackTicks(Math.max(1, t.seq - t.startSeq) + 1);
-      }
-    } else {
-      var v = findVehicleById(t.vehicleId);
-      if(!v){
-        t.missedPolls = (t.missedPolls || 0) + 1;
-        if(t.missedPolls >= 2){
-          // Bus dropped off the feed for good — look for a fresh one.
-          t.vehicleId = null;
-          t.startSeq = null;
-          t.missedPolls = 0;
-        }
-      } else {
-        t.missedPolls = 0;
-      }
-    }
-    updateProgressUI();
-  }
-
-  el.startTripBtn.addEventListener('click', function(){
-    var sel = state.selected;
-    if(!sel) return;
-    ensureAudioCtx(); // unlock audio now, on a real user gesture, so the alarm can play later
-
-    var v = nearestApproachingVehicle(sel.direction, sel.seq);
-    state.tracking = {
-      name: sel.name,
-      direction: sel.direction,
-      seq: sel.seq,
-      startSeq: v ? v.nextStopSeq : null,
-      vehicleId: v ? v.id : null,
-      missedPolls: 0
-    };
-    buildTrackTicks(state.tracking.startSeq !== null ? Math.max(1, sel.seq - state.tracking.startSeq) + 1 : 8);
-
-    el.liveRouteName.innerHTML = 'Route ' + live.route + ' · <strong>' + escapeHtml(sel.name) + '</strong>';
-    el.topbar.classList.add('is-live');
-    el.progressHeading.textContent = 'On Route ' + live.route + ', headed to ' + sel.name;
-    if(el.progressSub) el.progressSub.textContent = DEFAULT_PROGRESS_SUB;
-    showPanel('progress');
-    updateProgressUI();
-
-    var minutesAway = v ? Math.max(0, Math.round(((sel.seq - v.nextStopSeq) * AVG_SECS_PER_STOP) / 60)) : null;
-    requestAiStatus(sel.name, minutesAway, v ? v.late : null);
-  });
-
-  function endTrip(){
-    state.tracking = null;
-    stopAlarm();
-    el.topbar.classList.remove('is-live');
-    el.alertOverlay.classList.remove('show','buzz');
-    state.selected = null;
-    el.confirmBtn.disabled = true;
-    el.searchInput.value = '';
-    renderSuggestions();
-    showPanel('search');
-  }
-  el.endTripBtn.addEventListener('click', endTrip);
-  el.cancelTripBtn.addEventListener('click', endTrip);
-  el.resetDemoBtn.addEventListener('click', endTrip);
-  el.endFromAlertBtn.addEventListener('click', endTrip);
-
-  // ---------- Get-ready alert ----------
-  var alerted = false;
-  function triggerAlert(){
-    if(alerted) return; // fire once per trip
-    alerted = true;
-    var t = state.tracking;
-    el.alertStop.textContent = t.name;
-    el.alertOverlay.classList.add('show');
-    el.alertOverlay.classList.remove('buzz');
-    void el.alertOverlay.offsetWidth;
-    el.alertOverlay.classList.add('buzz');
-    el.alertOverlay.setAttribute('aria-hidden','false');
-    playStopMnemonic(t.name);
-    if(document.title.indexOf('Get ready') !== 0){
-      document.title = 'Get ready · ' + document.title;
-    }
-  }
-  el.keepTrackingBtn.addEventListener('click', function(){
-    el.alertOverlay.classList.remove('show','buzz');
-    stopAlarm();
-  });
-
-  function resetAlertFlag(){ alerted = false; }
-
-  // ---------- Panel switching ----------
-  function showPanel(name){
-    if(name === 'search') resetAlertFlag();
-    [el.panelSearch, el.panelConfirm, el.panelProgress].forEach(function(p){
-      p.classList.toggle('active', p.dataset.panel === name);
-    });
-  }
-
-  renderSuggestions();
-  renderStatus();
-  showPanel('search');
-  startPolling();
 })();

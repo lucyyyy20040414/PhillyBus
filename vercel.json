@@ -1,5 +1,8 @@
 {
   "buildCommand": null,
   "outputDirectory": ".",
-  "cleanUrls": true
+  "cleanUrls": true,
+  "functions": {
+    "api/*.js": { "maxDuration": 30 }
+  }
 }

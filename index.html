@@ -2,125 +2,122 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Philly Bus — get-off alerts for your bus</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#ffc800">
+<title>Philly Bus — Look Out the Window</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700&family=Barlow+Condensed:wght@600;700;800&display=swap">
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-screen="route">
 
-<header class="topbar" id="topbar">
-  <div class="topbar__inner">
-    <span class="brand">Philly Bus<sup>21</sup></span>
-
-    <span class="topbar__idle">Get-off alerts for the bus you're actually on.</span>
-
-    <div class="topbar__live">
-      <span class="live-route" id="liveRouteName">Route 21</span>
-      <div class="track">
-        <div class="track__line"><div class="track__fill" id="trackFill"></div></div>
-        <div class="track__stops" id="trackStops"></div>
-        <div class="track__bus" id="trackBus">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="13" rx="3" stroke="currentColor" stroke-width="2"/><path d="M3 12h18" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="20" r="1.6" fill="currentColor"/><circle cx="16" cy="20" r="1.6" fill="currentColor"/></svg>
-        </div>
-      </div>
-      <span class="live-eta" id="liveEta">12 min</span>
-      <button class="live-end" id="endTripBtn">End trip</button>
-    </div>
+<!-- 1 · ENTER ROUTE -->
+<section class="screen screen--route active" data-screen="route" id="screenRoute">
+  <div class="screen__top">
+    <p class="eyebrow">Philly Bus · Look Out the Window</p>
+    <h1>Which bus<br>are you on?</h1>
   </div>
-</header>
+  <form id="routeForm" autocomplete="off" novalidate>
+    <label class="sign-input" for="routeInput">
+      <span class="sign-input__label">Route</span>
+      <input id="routeInput" type="text" inputmode="text" maxlength="5" placeholder="42" autocapitalize="characters" spellcheck="false" aria-label="SEPTA bus route number">
+    </label>
+    <button class="btn btn--go" type="submit" id="routeBtn">Find my route</button>
+    <p class="form-note" id="routeNote" role="status" aria-live="polite"></p>
+  </form>
+  <p class="fine">Any SEPTA bus route. Tell us what you like — we'll point out the good stuff on your side of the window.</p>
+</section>
 
-<main>
+<!-- 2 · CHOOSE DIRECTION -->
+<section class="screen screen--dir" data-screen="dir" id="screenDir">
+  <div class="screen__top">
+    <div class="bullet bullet--sm" id="dirBullet">42</div>
+    <h1 class="h1--q">Which way<br>are you going?</h1>
+    <p class="live-line" id="dirName">—</p>
+  </div>
+  <div class="stack" id="dirList"></div>
+  <p class="fine"><button class="link-btn" type="button" id="dirBack">Different route</button></p>
+</section>
 
-  <!-- SEARCH -->
-  <section class="panel panel--search active" data-panel="search" id="panelSearch">
-    <h1>Where are you headed?</h1>
-    <p class="sub">Live SEPTA bus data — pick your stop and we'll watch the route for you.</p>
+<!-- 3 · CHOOSE INTEREST -->
+<section class="screen screen--interest" data-screen="interest" id="screenInterest">
+  <div class="screen__top">
+    <div class="bullet bullet--sm" id="interestBullet">42</div>
+    <h1 class="h1--q">What do you notice when exploring a city?</h1>
+  </div>
+  <div class="interest-grid" id="interestGrid"></div>
+</section>
 
-    <div class="routerow">
-      <label for="routeInput">Bus route</label>
-      <input id="routeInput" type="text" inputmode="numeric" value="21" maxlength="4" autocomplete="off">
-      <span class="live-status" id="liveStatus">Connecting to SEPTA…</span>
+<!-- 4 · RIDE MODE -->
+<section class="screen screen--ride" data-screen="ride" id="screenRide" data-state="locating">
+  <header class="ride-bar">
+    <div class="bullet bullet--sm" id="rideBullet">42</div>
+    <div class="ride-meta">
+      <span class="ride-meta__dir" id="rideDir">—</span>
+      <span class="ride-meta__interest" id="rideInterest">—</span>
     </div>
-    <p class="detour-banner" id="detourBanner" hidden></p>
+    <button class="icon-btn" type="button" id="soundBtn" aria-label="Sound on" aria-pressed="true"></button>
+    <button class="btn-mini" type="button" id="endRideBtn">End</button>
+  </header>
 
-    <div class="searchrow">
-      <svg width="22" height="22" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.2" stroke="currentColor" stroke-width="1.4"/><path d="M11 11L14.5 14.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-      <input id="searchInput" type="text" placeholder="Search your stop" autocomplete="off">
-      <button class="mic-btn" id="micBtn" title="Voice search" aria-label="Voice search">
-        <svg width="21" height="21" viewBox="0 0 16 16" fill="none"><rect x="6" y="1" width="4" height="8" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M3 8a5 5 0 0 0 10 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M8 13v2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-      </button>
-    </div>
-    <p class="voice-note" id="voiceNote" aria-live="polite"></p>
+  <!-- locating -->
+  <div class="ride-state ride-state--locating">
+    <p class="big-msg">Finding<br>you…</p>
+    <p class="sub-msg">Placing you on the <span id="locRoute">42</span>.</p>
+  </div>
 
-    <p class="sugg-label" id="suggLabel">Live stops on Route 21</p>
-    <ul class="sugg-list" id="suggList"></ul>
+  <!-- fallback: pick your bus -->
+  <div class="ride-state ride-state--pick">
+    <p class="eyebrow eyebrow--light">Which one are you on?</p>
+    <h2 class="pick-title" id="pickTitle">Pick your bus</h2>
+    <p class="sub-msg" id="pickNote"></p>
+    <ul class="pick-list" id="pickList"></ul>
+    <button class="btn btn--ghost btn--light" type="button" id="pickRetry">Look again</button>
+  </div>
 
-    <button class="btn-primary" id="confirmBtn" disabled style="margin-top:8px;">Confirm destination</button>
-  </section>
+  <!-- calm -->
+  <div class="ride-state ride-state--calm">
+    <p class="big-msg">Enjoy<br>the ride.</p>
+    <p class="sub-msg sub-msg--big" id="calmSub">Watching the road ahead.</p>
+    <div class="road" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
 
-  <!-- CONFIRM -->
-  <section class="panel panel--confirm" data-panel="confirm" id="panelConfirm">
-    <div class="confirm-card">
-      <div class="check-ring">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M5 12.5L10 17.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <!-- landmark alert card -->
+  <div class="ride-state ride-state--card">
+    <article class="card" id="card">
+      <div class="card__photo" id="cardPhoto">
+        <img id="cardImg" alt="" decoding="async">
+        <div class="card__photo-none" id="cardNone"></div>
+        <span class="card__credit" id="cardCredit"></span>
       </div>
-      <h2>Trip set!</h2>
-      <div class="trip-detail">
-        <div>
-          <div class="label">Get off at</div>
-          <div class="value" id="tripStop">33rd &amp; Spruce</div>
-        </div>
-        <div>
-          <div class="label">Tracking</div>
-          <div class="value" id="tripVehicle">Watching for a bus…</div>
-        </div>
+      <div class="look" id="look">
+        <svg class="look__arrow" viewBox="0 0 48 24" aria-hidden="true"><path d="M46 12H6M16 3 5 12l11 9" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="look__text" id="lookText">LOOK LEFT</span>
       </div>
-      <p class="note" id="tripLive">Live schedule info will appear here once a bus is locked in.</p>
-      <div class="confirm-actions">
-        <button class="btn-primary" id="startTripBtn">Start trip</button>
-        <button class="btn-text" id="changeDestBtn">Choose a different destination</button>
+      <div class="card__body">
+        <h2 class="card__name" id="cardName">—</h2>
+        <p class="card__stop" id="cardStop"></p>
+        <p class="card__when"><span id="cardKind">—</span><span class="dot">·</span><span id="cardWhen">—</span></p>
+        <p class="card__why"><span class="ai-tag" id="cardAi">AI note</span><span id="cardWhy">—</span></p>
       </div>
-    </div>
-  </section>
+    </article>
+  </div>
 
-  <!-- PROGRESS -->
-  <section class="panel panel--progress" data-panel="progress" id="panelProgress">
-    <div class="head">
-      <h1 id="progressHeading">On Route 21, headed to 33rd &amp; Spruce</h1>
-      <p class="sub" id="progressSub">Browse, work, whatever — the bar up top keeps watch. We'll interrupt you when it matters.</p>
-    </div>
-    <ul class="stoplist" id="stoplist"></ul>
-    <button class="btn-text" id="cancelTripBtn">Cancel trip</button>
-  </section>
+  <footer class="ride-foot">
+    <span id="rideNext">—</span>
+    <span class="ride-foot__credit">SEPTA · OpenStreetMap · Wikipedia</span>
+  </footer>
+</section>
 
-</main>
-
-<footer>
-  <span>Live data from SEPTA's public API · not affiliated with or endorsed by SEPTA</span>
-  <button id="resetDemoBtn">Reset</button>
+<footer class="site-foot" id="siteFoot">
+  <p>UPenn prototyping course project — not affiliated with or endorsed by SEPTA. Live bus positions: SEPTA. Landmarks: © OpenStreetMap contributors. Photos &amp; facts: Wikipedia / Wikimedia Commons. Short notes: rewritten by Google Gemini from the facts above.</p>
 </footer>
 
-<!-- GET READY OVERLAY -->
-<div class="alert-overlay" id="alertOverlay" role="alertdialog" aria-live="assertive" aria-hidden="true">
-  <div class="rings">
-    <div class="ring-set"><span></span><span></span><span></span></div>
-    <div class="bell">
-      <svg width="38" height="38" viewBox="0 0 24 24" fill="none"><path d="M12 3C9 3 7.2 5.2 7.2 8.4V11.5c0 1.6-.6 3.1-1.7 4.3h13c-1.1-1.2-1.7-2.7-1.7-4.3V8.4C16.8 5.2 15 3 12 3Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 18.5a2 2 0 0 0 4 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-    </div>
-    <div class="ring-set right"><span></span><span></span><span></span></div>
-  </div>
-  <h2>Get ready</h2>
-  <div class="next-stop">Next stop</div>
-  <div class="stop-name" id="alertStop">33rd &amp; Spruce</div>
-  <p class="instruction">Stand near the door — this one's yours.</p>
-  <div class="alert-actions">
-    <button class="ghost" id="keepTrackingBtn">Not yet — keep tracking</button>
-    <button class="primary" id="endFromAlertBtn">I'm off — end trip</button>
-  </div>
-</div>
-
+<script src="js/geo.js"></script>
+<script src="js/septa.js"></script>
+<script src="js/route.js"></script>
+<script src="js/interests.js"></script>
+<script src="js/ride.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
