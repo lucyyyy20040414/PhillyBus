@@ -1,8 +1,8 @@
 /* Ride engine: knows where the rider is ALONG the chosen route and decides, second by
    second, whether there is a landmark worth interrupting them for.
 
-   - Position: every GPS (or tracked-bus) fix is snapped onto the route's shape, giving
-     `s`, meters travelled along it. Between fixes it is dead-reckoned from measured speed.
+   - Position: every reported bus fix is snapped onto the route's shape, giving `s`,
+     meters travelled along it. Between fixes it is dead-reckoned from measured speed.
    - Landmarks: fetched from /api/landmarks one 1 km stretch of the route at a time (the
      stretch the rider is in and the next one). The server picks them with fixed rules;
      an AI only rewrites each one's description.
@@ -62,7 +62,7 @@
       var ds = sn.s - s.pos.s;
       var sp = typeof fix.speed === 'number' && fix.speed >= 0 ? fix.speed : (dt > 1 ? Math.max(0, ds) / dt : s.pos.speed);
       if (sp <= 25) s.pos.speed = 0.5 * s.pos.speed + 0.5 * sp;
-      if (!(ds < 0 && ds > -40)) s.pos.s = sn.s; // ignore small backward GPS jitter
+      if (!(ds < 0 && ds > -40)) s.pos.s = sn.s; // ignore small backward position jitter
       s.pos.rx = now;
     }
 

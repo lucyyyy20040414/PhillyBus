@@ -1,6 +1,6 @@
 /* SEPTA live data: TransitView (position, heading, direction, destination, next stop
    of every bus on a route). It has no CORS support, so it's called via JSONP.
-   Only used as a fallback, when the rider's own GPS isn't available. */
+   This is how the app follows a rider's bus — no device location is used. */
 (function () {
   window.PB = window.PB || {};
 

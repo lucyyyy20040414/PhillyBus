@@ -1,8 +1,10 @@
 /* UI + flow:  ENTER ROUTE → CHOOSE DIRECTION → CHOOSE INTEREST → RIDE.
-   The route's ordered stops come from data/routes/*.json; the rider's GPS position is
-   placed on that route; landmarks near the stops ahead come from /api/landmarks.
-   All the "is a landmark coming up" logic lives in js/ride.js; this file only moves
-   between screens and paints what the engine reports. */
+   The route's ordered stops come from data/routes/*.json (SEPTA's published schedule
+   data, built offline — nothing live). To follow along, the rider picks their bus from
+   SEPTA's live vehicle feed and the app tracks that bus's reported position along the
+   route; no device location is used. Landmarks near the stops ahead come from
+   /api/landmarks. All the "is a landmark coming up" logic lives in js/ride.js; this
+   file only moves between screens and paints what the engine reports. */
 (function () {
   var PB = window.PB;
   var $ = function (id) { return document.getElementById(id); };
@@ -20,11 +22,10 @@
     cardWhen: $('cardWhen'), cardWhy: $('cardWhy'), cardAi: $('cardAi')
   };
 
-  var GPS_ON_ROUTE_M = 120; // first fix must be this close to the chosen direction's route
   var state = {
     route: '', doc: null, dir: null, interest: null,
-    engine: null, watchId: null, vehTimer: null, simTimer: null,
-    token: 0, lastCardId: null, wrongWay: 0
+    engine: null, vehTimer: null, simTimer: null,
+    token: 0, lastCardId: null
   };
   var soundOn = true;
   try { soundOn = localStorage.getItem('pb.sound') !== 'off'; } catch (e) {}
@@ -139,85 +140,34 @@
     if (simFrom !== undefined) startSimulated(simFrom); else startLocating();
   }
 
-  /* ---------- 4 · ride: place the rider on the route ---------- */
+  /* ---------- 4 · ride: follow the rider's bus along the route ---------- */
   function stopTracking() {
     state.token++;
     if (state.engine) { state.engine.stop(); state.engine = null; }
-    if (state.watchId !== null) { navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
     clearInterval(state.vehTimer); state.vehTimer = null;
     clearInterval(state.simTimer); state.simTimer = null;
     state.lastCardId = null;
-    state.wrongWay = 0;
-  }
-
-  function getUserPosition() {
-    return new Promise(function (resolve) {
-      if (!navigator.geolocation) { resolve(null); return; }
-      var done = false;
-      var timer = setTimeout(function () { if (!done) { done = true; resolve(null); } }, 9000);
-      navigator.geolocation.getCurrentPosition(function (p) {
-        if (done) return;
-        done = true; clearTimeout(timer);
-        resolve({ lat: p.coords.latitude, lng: p.coords.longitude });
-      }, function () {
-        if (done) return;
-        done = true; clearTimeout(timer);
-        resolve(null);
-      }, { enableHighAccuracy: true, timeout: 8000, maximumAge: 15000 });
-    });
-  }
-
-  function startLocating() {
-    stopTracking();
-    setRideState('locating');
-    var token = state.token;
-    getUserPosition().then(function (user) {
-      if (token !== state.token) return; // rider ended the ride or started over
-      var sn = user ? PB.route.snap(state.dir, user.lat, user.lng, null) : null;
-      if (sn && sn.dist <= GPS_ON_ROUTE_M) { trackGps(); return; }
-      startVehicleFallback(token, user ? "You don't seem to be on this route right now." : 'Location is off, so tell us which bus you\'re on.');
-    });
   }
 
   function newEngine() {
     return PB.ride.start({ route: state.route, dir: state.dir, interest: state.interest.key, onFrame: onFrame });
   }
 
-  // Main path: the rider's own phone, riding along.
-  function trackGps() {
+  // Let the rider pick their bus from SEPTA's live list for this direction.
+  function startLocating() {
+    stopTracking();
+    setRideState('locating');
     var token = state.token;
-    setRideState('calm');
-    el.calmSub.textContent = 'Getting your location…';
-    state.engine = newEngine();
-    state.watchId = navigator.geolocation.watchPosition(function (p) {
-      if (token !== state.token || !state.engine) return;
-      var c = p.coords;
-      state.engine.feed({ lat: c.latitude, lng: c.longitude, speed: typeof c.speed === 'number' && isFinite(c.speed) ? c.speed : null });
-      checkWrongWay(c);
-    }, function () {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
-    keepAwake();
-  }
-
-  // Moving fast the opposite way to the chosen direction, several fixes in a row?
-  function checkWrongWay(c) {
-    if (typeof c.heading !== 'number' || !isFinite(c.heading) || !(c.speed > 3)) { state.wrongWay = 0; return; }
-    var sn = PB.route.snap(state.dir, c.latitude, c.longitude, state.engine.position());
-    if (sn && sn.dist < GPS_ON_ROUTE_M && PB.geo.angleDiff(c.heading, sn.bearing) > 130) state.wrongWay++;
-    else state.wrongWay = 0;
-  }
-
-  // Fallback: no usable GPS. Let the rider pick their bus from SEPTA's live list for this direction.
-  function startVehicleFallback(token, message) {
     PB.septa.vehicles(state.route).then(function (vs) { return { vs: vs }; }, function () { return { vs: [], failed: true }; })
       .then(function (r) {
-        if (token !== state.token) return;
+        if (token !== state.token) return; // rider ended the ride or started over
         var mine = r.vs.filter(function (v) {
           var sn = PB.route.snap(state.dir, v.lat, v.lng, null);
           if (!sn || sn.dist > 100) return false;
           v.snapS = sn.s;
           return v.heading === null || PB.geo.angleDiff(v.heading, sn.bearing) <= 90;
         });
-        showPicker(mine, r.failed ? "Couldn't reach SEPTA just now." : mine.length ? message : 'No Route ' + state.route + ' ' + (state.dir.label || 'buses') + ' are reporting right now.');
+        showPicker(mine, r.failed ? "Couldn't reach SEPTA just now." : !mine.length ? 'No Route ' + state.route + ' ' + (state.dir.label || 'buses') + ' are reporting right now.' : '');
       });
   }
 
@@ -295,11 +245,10 @@
       renderCard(f.card, f.fresh);
       setRideState('card');
     } else {
-      el.calmSub.textContent = !f.hasFix ? 'Getting your location…'
+      el.calmSub.textContent = !f.hasFix ? 'Waiting for your bus’s next position…'
         : f.atEnd ? 'End of the line. Thanks for riding!'
-        : f.offRoute ? "You're off Route " + state.route + ' right now.'
-        : f.stale ? 'Waiting for a location update…'
-        : state.wrongWay >= 3 ? 'Looks like you\'re heading the other way. Tap End and pick the other direction.'
+        : f.offRoute ? "This bus looks to be off Route " + state.route + ' right now.'
+        : f.stale ? 'Waiting for a position update…'
         : f.nextMin ? 'Next discovery in ~' + f.nextMin + ' min.'
         : f.loading ? 'Scanning ahead…'
         : 'Watching the road ahead.';

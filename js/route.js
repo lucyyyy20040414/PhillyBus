@@ -1,5 +1,5 @@
 /* Route data: the ordered stops and shape for any SEPTA bus route (built from SEPTA's
-   GTFS feed into data/routes/*.json), plus "where along this route is that GPS point?".
+   GTFS feed into data/routes/*.json), plus "where along this route is that point?".
 
    Everything is measured as `s` = meters travelled along the route in one direction,
    so "what is ahead of the bus" is just "what has a bigger s". */
@@ -82,8 +82,9 @@
     return best;
   }
 
-  // Where along `dir` is this GPS point? Uses the last known position (`hintS`) first,
-  // so a route that passes the same street twice can't snap the rider to the wrong pass.
+  // Where along `dir` is this point (a bus's reported lat/lng)? Uses the last known
+  // position (`hintS`) first, so a route that passes the same street twice can't snap
+  // the rider to the wrong pass.
   // -> { s, dist (meters off the route), bearing (direction of the route right there) }
   function snap(dir, lat, lng, hintS) {
     var n = dir.shape.length;
